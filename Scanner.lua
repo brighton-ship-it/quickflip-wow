@@ -30,12 +30,12 @@ local processingQueue = false
 -------------------------------------------------------------------------------
 
 local scanFrame = CreateFrame("Frame")
-scanFrame:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
-scanFrame:RegisterEvent("ITEM_SEARCH_RESULTS_UPDATED")
-scanFrame:RegisterEvent("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
-scanFrame:RegisterEvent("AUCTION_HOUSE_BROWSE_RESULTS_ADDED")
-scanFrame:RegisterEvent("AUCTION_HOUSE_NEW_RESULTS_RECEIVED")
-scanFrame:RegisterEvent("REPLICATE_ITEM_LIST_UPDATE")
+-- scanFrame:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
+-- scanFrame:RegisterEvent("ITEM_SEARCH_RESULTS_UPDATED")
+-- scanFrame:RegisterEvent("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+-- scanFrame:RegisterEvent("AUCTION_HOUSE_BROWSE_RESULTS_ADDED")
+-- scanFrame:RegisterEvent("AUCTION_HOUSE_NEW_RESULTS_RECEIVED")
+-- scanFrame:RegisterEvent("REPLICATE_ITEM_LIST_UPDATE")
 
 scanFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "COMMODITY_SEARCH_RESULTS_UPDATED" then

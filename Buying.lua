@@ -14,11 +14,11 @@ QF.lastSearchItemID = nil
 -------------------------------------------------------------------------------
 
 local buyFrame = CreateFrame("Frame")
-buyFrame:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
-buyFrame:RegisterEvent("ITEM_SEARCH_RESULTS_UPDATED")
-buyFrame:RegisterEvent("COMMODITY_PURCHASE_SUCCEEDED")
-buyFrame:RegisterEvent("COMMODITY_PURCHASE_FAILED")
-buyFrame:RegisterEvent("AUCTION_HOUSE_PURCHASE_COMPLETED")
+-- buyFrame:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
+-- buyFrame:RegisterEvent("ITEM_SEARCH_RESULTS_UPDATED")
+-- buyFrame:RegisterEvent("COMMODITY_PURCHASE_SUCCEEDED")
+-- buyFrame:RegisterEvent("COMMODITY_PURCHASE_FAILED")
+-- buyFrame:RegisterEvent("AUCTION_HOUSE_PURCHASE_COMPLETED")
 
 buyFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "COMMODITY_SEARCH_RESULTS_UPDATED" then

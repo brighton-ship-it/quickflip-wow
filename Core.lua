@@ -171,8 +171,8 @@ eventFrame:RegisterEvent("PLAYER_LOGOUT")
 eventFrame:RegisterEvent("AUCTION_HOUSE_SHOW")
 eventFrame:RegisterEvent("AUCTION_HOUSE_CLOSED")
 eventFrame:RegisterEvent("PLAYER_MONEY")
-eventFrame:RegisterEvent("AUCTION_HOUSE_PURCHASE_COMPLETED")
-eventFrame:RegisterEvent("AUCTION_HOUSE_AUCTION_CREATED")
+-- eventFrame:RegisterEvent("AUCTION_HOUSE_PURCHASE_COMPLETED")
+-- eventFrame:RegisterEvent("AUCTION_HOUSE_AUCTION_CREATED")
 
 eventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then

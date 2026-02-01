@@ -23,10 +23,10 @@ local DURATIONS = {
 local sellFrame = CreateFrame("Frame")
 sellFrame:RegisterEvent("BAG_UPDATE")
 sellFrame:RegisterEvent("AUCTION_HOUSE_SHOW")
-sellFrame:RegisterEvent("ITEM_SEARCH_RESULTS_UPDATED")
-sellFrame:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
-sellFrame:RegisterEvent("AUCTION_HOUSE_AUCTION_CREATED")
-sellFrame:RegisterEvent("AUCTION_HOUSE_POST_ERROR")
+-- sellFrame:RegisterEvent("ITEM_SEARCH_RESULTS_UPDATED")
+-- sellFrame:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
+-- sellFrame:RegisterEvent("AUCTION_HOUSE_AUCTION_CREATED")
+-- sellFrame:RegisterEvent("AUCTION_HOUSE_POST_ERROR")
 
 sellFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "BAG_UPDATE" and QF.isAHOpen then
