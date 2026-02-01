@@ -1,529 +1,292 @@
 --[[
     QuickFlip - Buying.lua
-    Smart buying with deal detection and instant purchase
+    Search display, deal detection, and purchasing
+    Classic Era (Interface 11503)
 ]]
 
 local addonName, QF = ...
 
--- Search results cache
-QF.searchResults = {}
-QF.lastSearchItemID = nil
-
 -------------------------------------------------------------------------------
--- Event Registration
+-- Search Results
 -------------------------------------------------------------------------------
 
-local buyFrame = CreateFrame("Frame")
--- buyFrame:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
--- buyFrame:RegisterEvent("ITEM_SEARCH_RESULTS_UPDATED")
--- buyFrame:RegisterEvent("COMMODITY_PURCHASE_SUCCEEDED")
--- buyFrame:RegisterEvent("COMMODITY_PURCHASE_FAILED")
--- buyFrame:RegisterEvent("AUCTION_HOUSE_PURCHASE_COMPLETED")
-
-buyFrame:SetScript("OnEvent", function(self, event, ...)
-    if event == "COMMODITY_SEARCH_RESULTS_UPDATED" then
-        QF:OnBuySearchResults(...)
-    elseif event == "ITEM_SEARCH_RESULTS_UPDATED" then
-        QF:OnBuyItemResults(...)
-    elseif event == "COMMODITY_PURCHASE_SUCCEEDED" then
-        QF:OnPurchaseSucceeded(...)
-    elseif event == "COMMODITY_PURCHASE_FAILED" then
-        QF:OnPurchaseFailed(...)
-    elseif event == "AUCTION_HOUSE_PURCHASE_COMPLETED" then
-        QF:OnItemPurchaseCompleted(...)
-    end
-end)
+QF.lastSearchResults = {}
+QF.selectedAuction = nil
 
 -------------------------------------------------------------------------------
--- Search Results Processing
+-- Search Function
 -------------------------------------------------------------------------------
 
-function QF:OnBuySearchResults(itemID)
-    if not itemID then return end
-    
-    self.lastSearchItemID = itemID
-    local numResults = C_AuctionHouse.GetNumCommoditySearchResults(itemID)
-    if numResults == 0 then return end
-    
-    self.searchResults = {}
-    
-    local marketPrice = self:GetMarketPrice(itemID)
-    
-    for i = 1, min(numResults, 200) do
-        local result = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, i)
-        if result then
-            local marketPercent = marketPrice and floor((result.unitPrice / marketPrice) * 100) or nil
-            
-            table.insert(self.searchResults, {
-                index = i,
-                itemID = itemID,
-                unitPrice = result.unitPrice,
-                quantity = result.quantity,
-                numOwnerItems = result.numOwnerItems,
-                containsOwnerItem = result.containsOwnerItem,
-                isCommodity = true,
-                marketPrice = marketPrice,
-                marketPercent = marketPercent,
-                dealRating = self:GetDealRating(marketPercent),
-            })
-        end
+function QF:DoSearch(searchText)
+    if not searchText or searchText == "" then
+        self.lastSearchResults = {}
+        self:UpdateBuyList()
+        return
     end
     
-    -- Store price data
-    if self.searchResults[1] then
-        self:StorePrice(itemID, self.searchResults[1].unitPrice, numResults)
-    end
-    
-    -- Update UI
-    if self.buyFrame and self.buyFrame:IsVisible() then
-        self:UpdateBuyingDisplay()
-    end
-end
-
-function QF:OnBuyItemResults(itemKey)
-    if not itemKey then return end
-    
-    self.lastSearchItemID = itemKey.itemID
-    local numResults = C_AuctionHouse.GetNumItemSearchResults(itemKey)
-    if numResults == 0 then return end
-    
-    self.searchResults = {}
-    
-    local marketPrice = self:GetMarketPrice(itemKey.itemID)
-    
-    for i = 1, min(numResults, 200) do
-        local result = C_AuctionHouse.GetItemSearchResultInfo(itemKey, i)
-        if result and result.buyoutAmount then
-            local marketPercent = marketPrice and floor((result.buyoutAmount / marketPrice) * 100) or nil
-            
-            table.insert(self.searchResults, {
-                index = i,
-                itemID = itemKey.itemID,
-                itemKey = itemKey,
-                auctionID = result.auctionID,
-                unitPrice = result.buyoutAmount,
-                quantity = result.quantity or 1,
-                itemLink = result.itemLink,
-                timeLeft = result.timeLeft,
-                isCommodity = false,
-                marketPrice = marketPrice,
-                marketPercent = marketPercent,
-                dealRating = self:GetDealRating(marketPercent),
-            })
-        end
-    end
-    
-    -- Store price data
-    if self.searchResults[1] then
-        self:StorePrice(itemKey.itemID, self.searchResults[1].unitPrice, numResults)
-    end
-    
-    if self.buyFrame and self.buyFrame:IsVisible() then
-        self:UpdateBuyingDisplay()
-    end
-end
-
--------------------------------------------------------------------------------
--- Purchase Functions
--------------------------------------------------------------------------------
-
-function QF:ConfirmBuy(resultData, quantity)
-    if not resultData then return end
-    
-    quantity = quantity or (resultData.isCommodity and resultData.quantity or 1)
-    
-    local itemName, itemLink = C_Item.GetItemInfo(resultData.itemID)
-    local totalPrice = resultData.unitPrice * quantity
-    local marketPrice = resultData.marketPrice or resultData.unitPrice
-    
-    local dialog = StaticPopup_Show("QUICKFLIP_CONFIRM_BUY", 
-        itemLink or itemName or "Item",
-        self:FormatGold(totalPrice),
-        self:FormatGold(marketPrice * quantity),
-        self:FormatPercent(resultData.marketPercent))
-    
-    if dialog then
-        dialog.data = {
-            resultData = resultData,
-            quantity = quantity,
-            itemName = itemName,
-            totalPrice = totalPrice,
-        }
-    end
-end
-
-function QF:ExecuteBuy(data)
-    if not data then return end
-    
-    local result = data.resultData or data
-    local quantity = data.quantity or 1
-    
-    if result.isCommodity then
-        -- Commodity purchase
-        C_AuctionHouse.StartCommoditiesPurchase(result.itemID, quantity)
-    else
-        -- Item purchase
-        if result.auctionID then
-            C_AuctionHouse.PlaceBid(result.auctionID, result.unitPrice)
-        end
-    end
-    
-    self:Debug("Executing purchase:", data.itemName or result.itemID, "x", quantity)
-end
-
--- Instant buy (skip confirmation for great deals)
-function QF:InstantBuy(resultData, quantity)
-    if not resultData then return end
-    
-    -- Safety check - only instant buy if it's really a deal
-    if resultData.marketPercent and resultData.marketPercent < 70 then
-        local data = {
-            resultData = resultData,
-            quantity = quantity or 1,
-            itemName = C_Item.GetItemInfo(resultData.itemID) or "Item",
-            totalPrice = resultData.unitPrice * (quantity or 1),
-        }
-        self:ExecuteBuy(data)
-        return true
-    end
-    
-    return false
-end
-
--- Buy all deals below threshold
-function QF:BuyAllDeals(maxPercent)
-    maxPercent = maxPercent or 70
-    local bought = 0
-    
-    for _, result in ipairs(self.searchResults) do
-        if result.marketPercent and result.marketPercent <= maxPercent then
-            if self:InstantBuy(result, result.quantity) then
-                bought = bought + 1
-            end
-        end
-    end
-    
-    if bought > 0 then
-        self:Print("Bought", bought, "deals!")
-    else
-        self:Print("No deals below", maxPercent .. "% found")
-    end
-end
-
--------------------------------------------------------------------------------
--- Purchase Event Handlers
--------------------------------------------------------------------------------
-
-function QF:OnPurchaseSucceeded(itemID)
-    local itemName, itemLink = C_Item.GetItemInfo(itemID)
-    self:Print("|cff00ff00Purchased:|r", itemLink or itemName or "Item")
-    
-    -- Record transaction with cost basis
-    local result = self.searchResults[1]
-    if result and result.itemID == itemID then
-        self:RecordPurchase(itemID, result.unitPrice, 1, itemName)
-    end
-    
-    -- Play success sound
-    if self.config and self.config.soundAlerts then
-        PlaySound(SOUNDKIT.AUCTION_WINDOW_CLOSE)
-    end
-end
-
-function QF:OnPurchaseFailed(itemID)
-    local itemName, itemLink = C_Item.GetItemInfo(itemID)
-    self:Print("|cffff0000Purchase failed:|r", itemLink or itemName or "Item", "- sold out or error")
-end
-
-function QF:OnItemPurchaseCompleted(auctionID)
-    -- Find the auction in our results
-    for _, result in ipairs(self.searchResults) do
-        if result.auctionID == auctionID then
-            local itemName, itemLink = C_Item.GetItemInfo(result.itemID)
-            self:Print("|cff00ff00Purchased:|r", itemLink or itemName or "Item")
-            self:RecordPurchase(result.itemID, result.unitPrice, result.quantity, itemName)
-            break
-        end
-    end
-end
-
--------------------------------------------------------------------------------
--- Deal Helpers
--------------------------------------------------------------------------------
-
-function QF:GetBestDeals(maxPercent)
-    maxPercent = maxPercent or 80
-    local deals = {}
-    
-    for _, result in ipairs(self.searchResults) do
-        if result.marketPercent and result.marketPercent <= maxPercent then
-            table.insert(deals, result)
-        end
-    end
-    
-    table.sort(deals, function(a, b)
-        return (a.marketPercent or 100) < (b.marketPercent or 100)
+    self:StartSearch(searchText, function(results)
+        self.lastSearchResults = results or {}
+        self:SortResults()
+        self:UpdateBuyList()
     end)
-    
-    return deals
 end
 
-function QF:HasDeals(maxPercent)
-    return #self:GetBestDeals(maxPercent or 80) > 0
-end
-
--------------------------------------------------------------------------------
--- Search Functions
--------------------------------------------------------------------------------
-
-function QF:SearchItem(itemID)
-    if not self.isAHOpen then
-        self:Print("Auction House must be open!")
-        return
-    end
-    
-    local itemKey = C_AuctionHouse.MakeItemKey(itemID)
-    if itemKey then
-        C_AuctionHouse.SendSearchQuery(itemKey, {}, false)
-    end
-end
-
-function QF:SearchByName(searchString)
-    if not self.isAHOpen then
-        self:Print("Auction House must be open!")
-        return
-    end
-    
-    local query = {
-        searchString = searchString,
-        sorts = {
-            {sortOrder = Enum.AuctionHouseSortOrder.Price, reverseSort = false},
-        },
-    }
-    
-    C_AuctionHouse.SendBrowseQuery(query)
+function QF:SortResults()
+    -- Sort by unit price (lowest first)
+    table.sort(self.lastSearchResults, function(a, b)
+        return (a.unitPrice or 0) < (b.unitPrice or 0)
+    end)
 end
 
 -------------------------------------------------------------------------------
--- UI Update
+-- Buy List UI Update
 -------------------------------------------------------------------------------
 
-function QF:UpdateBuyingDisplay()
-    if not self.buyFrame then return end
+function QF:UpdateBuyList()
+    if not self.buyFrame or not self.buyFrame.scrollFrame then return end
     
-    -- Clear rows
-    for _, row in ipairs(self.buyFrame.rows or {}) do
-        row:Hide()
-    end
+    local scrollContent = self.buyFrame.scrollContent
     
-    self.buyFrame.rows = self.buyFrame.rows or {}
-    
-    -- Show search item info
-    if self.lastSearchItemID then
-        local itemName, itemLink, _, _, _, _, _, _, _, itemIcon = C_Item.GetItemInfo(self.lastSearchItemID)
-        if self.buyFrame.searchIcon then
-            self.buyFrame.searchIcon:SetTexture(itemIcon or "Interface\\Icons\\INV_Misc_QuestionMark")
-        end
-        if self.buyFrame.searchName then
-            self.buyFrame.searchName:SetText(itemName or "Searching...")
-        end
-        if self.buyFrame.resultCount then
-            self.buyFrame.resultCount:SetText(#self.searchResults .. " listings")
+    -- Clear existing buttons
+    if self.buyButtons then
+        for _, btn in ipairs(self.buyButtons) do
+            btn:Hide()
         end
     end
+    self.buyButtons = {}
     
-    -- Build rows
-    local yOffset = -5
-    local dealCount = 0
+    local results = self.lastSearchResults or {}
+    local yOffset = 0
     
-    for i, result in ipairs(self.searchResults) do
-        if i > 25 then break end
-        
-        local row = self.buyFrame.rows[i]
-        if not row then
-            row = self:CreateBuyRow(self.buyFrame.scrollChild, i)
-            self.buyFrame.rows[i] = row
-        end
-        
-        self:UpdateBuyRow(row, result)
-        row:SetPoint("TOPLEFT", self.buyFrame.scrollChild, "TOPLEFT", 0, yOffset)
-        row:Show()
-        
-        yOffset = yOffset - 32
-        
-        if result.marketPercent and result.marketPercent < 80 then
-            dealCount = dealCount + 1
-        end
+    for i, auction in ipairs(results) do
+        local btn = self:CreateAuctionButton(scrollContent, auction, i)
+        btn:SetPoint("TOPLEFT", 0, -yOffset)
+        btn:Show()
+        table.insert(self.buyButtons, btn)
+        yOffset = yOffset + 32
     end
     
-    self.buyFrame.scrollChild:SetHeight(math.abs(yOffset) + 20)
+    -- Update scroll content height
+    scrollContent:SetHeight(math.max(1, yOffset))
     
-    -- Update deal count
-    if self.buyFrame.dealCount then
-        if dealCount > 0 then
-            self.buyFrame.dealCount:SetText("|cff00ff00" .. dealCount .. " deals!|r")
-        else
-            self.buyFrame.dealCount:SetText("")
-        end
+    -- Update result count
+    if self.buyFrame.resultCount then
+        self.buyFrame.resultCount:SetText(#results .. " results")
     end
 end
 
-function QF:CreateBuyRow(parent, index)
-    local row = CreateFrame("Button", nil, parent, "BackdropTemplate")
-    row:SetSize(385, 30)
-    row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
+function QF:CreateAuctionButton(parent, auction, index)
+    local btn = CreateFrame("Button", nil, parent)
+    btn:SetSize(parent:GetWidth() - 20, 30)
     
-    -- Deal indicator bar (left edge)
-    row.dealBar = row:CreateTexture(nil, "BACKGROUND")
-    row.dealBar:SetSize(4, 28)
-    row.dealBar:SetPoint("LEFT", 0, 0)
+    -- Background
+    local bg = btn:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetColorTexture(0.1, 0.1, 0.1, 0.8)
+    btn.bg = bg
+    
+    -- Highlight
+    local highlight = btn:CreateTexture(nil, "HIGHLIGHT")
+    highlight:SetAllPoints()
+    highlight:SetColorTexture(0.3, 0.3, 0.3, 0.5)
     
     -- Icon
-    row.icon = row:CreateTexture(nil, "ARTWORK")
-    row.icon:SetSize(26, 26)
-    row.icon:SetPoint("LEFT", 8, 0)
+    local icon = btn:CreateTexture(nil, "ARTWORK")
+    icon:SetSize(24, 24)
+    icon:SetPoint("LEFT", 4, 0)
+    icon:SetTexture(auction.texture)
     
-    -- Quantity
-    row.qty = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row.qty:SetPoint("LEFT", row.icon, "RIGHT", 5, 0)
-    row.qty:SetWidth(45)
-    row.qty:SetJustifyH("LEFT")
+    -- Item name with quality color
+    local nameText = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    nameText:SetPoint("LEFT", icon, "RIGHT", 4, 0)
+    nameText:SetWidth(150)
+    nameText:SetJustifyH("LEFT")
     
-    -- Price
-    row.price = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    row.price:SetPoint("LEFT", row.qty, "RIGHT", 5, 0)
-    row.price:SetWidth(85)
-    row.price:SetJustifyH("LEFT")
-    
-    -- Market %
-    row.percent = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    row.percent:SetPoint("LEFT", row.price, "RIGHT", 5, 0)
-    row.percent:SetWidth(55)
-    
-    -- Deal rating
-    row.rating = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row.rating:SetPoint("LEFT", row.percent, "RIGHT", 5, 0)
-    row.rating:SetWidth(60)
-    
-    -- Buy button
-    row.buyBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-    row.buyBtn:SetSize(50, 24)
-    row.buyBtn:SetPoint("RIGHT", -5, 0)
-    row.buyBtn:SetText("Buy")
-    
-    -- Keyboard hint
-    row.hint = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row.hint:SetPoint("RIGHT", row.buyBtn, "LEFT", -5, 0)
-    row.hint:SetTextColor(0.5, 0.5, 0.5)
-    
-    return row
-end
-
-function QF:UpdateBuyRow(row, data)
-    local _, _, _, _, _, _, _, _, _, itemIcon = C_Item.GetItemInfo(data.itemID)
-    
-    row.icon:SetTexture(itemIcon or "Interface\\Icons\\INV_Misc_QuestionMark")
-    row.qty:SetText("x" .. (data.quantity or 1))
-    row.price:SetText(self:FormatGoldShort(data.unitPrice))
-    
-    -- Deal indicator bar color
-    local r, g, b = self:GetPriceColor(data.marketPercent)
-    row.dealBar:SetColorTexture(r, g, b, 0.8)
-    
-    -- Market percent
-    row.percent:SetText(self:FormatPercent(data.marketPercent))
-    
-    -- Deal rating
-    row.rating:SetText(data.dealRating or "")
-    
-    -- Keyboard hint for top rows
-    if data.index and data.index <= 5 then
-        row.hint:SetText("[" .. data.index .. "]")
-    else
-        row.hint:SetText("")
+    local qualityColor = ITEM_QUALITY_COLORS[auction.quality or 1]
+    if qualityColor then
+        nameText:SetTextColor(qualityColor.r, qualityColor.g, qualityColor.b)
     end
     
-    row.data = data
-    
-    -- Buy button styling based on deal quality
-    if data.marketPercent and data.marketPercent < 70 then
-        row.buyBtn:SetText("BUY!")
-        -- Could add glow effect here
-    else
-        row.buyBtn:SetText("Buy")
+    local displayName = auction.name
+    if auction.count > 1 then
+        displayName = displayName .. " x" .. auction.count
     end
+    nameText:SetText(displayName)
     
-    row.buyBtn:SetScript("OnClick", function()
-        QF:ConfirmBuy(data, data.isCommodity and 1 or data.quantity)
-    end)
+    -- Unit price
+    local priceText = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    priceText:SetPoint("LEFT", nameText, "RIGHT", 10, 0)
+    priceText:SetWidth(80)
+    priceText:SetJustifyH("RIGHT")
+    priceText:SetText(self:FormatGoldShort(auction.unitPrice))
     
-    -- Double-click for instant buy on great deals
-    row:SetScript("OnDoubleClick", function()
-        if data.marketPercent and data.marketPercent < 60 then
-            QF:InstantBuy(data, 1)
-        else
-            QF:ConfirmBuy(data, 1)
+    -- Percent of market
+    local pctText = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    pctText:SetPoint("LEFT", priceText, "RIGHT", 10, 0)
+    pctText:SetWidth(50)
+    pctText:SetJustifyH("RIGHT")
+    
+    local percent = self:GetPercentOfMarket(auction.itemId, auction.unitPrice)
+    if percent then
+        local r, g, b = self:GetPriceColor(percent)
+        pctText:SetText(percent .. "%")
+        pctText:SetTextColor(r, g, b)
+        
+        -- Color row background for deals
+        if percent < 80 then
+            bg:SetColorTexture(0, 0.2, 0, 0.5)
+        elseif percent > 100 then
+            bg:SetColorTexture(0.2, 0, 0, 0.3)
         end
+    else
+        pctText:SetText("--")
+        pctText:SetTextColor(0.5, 0.5, 0.5)
+    end
+    
+    -- Store auction data
+    btn.auction = auction
+    
+    -- Click handler
+    btn:SetScript("OnClick", function(self)
+        QF:SelectAuction(self.auction)
     end)
     
     -- Tooltip
-    row:SetScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetItemByID(data.itemID)
-        GameTooltip:AddLine(" ")
-        
-        if data.marketPrice then
-            GameTooltip:AddDoubleLine("Market Price:", QF:FormatGold(data.marketPrice), 1, 1, 1, 1, 1, 1)
+    btn:SetScript("OnEnter", function(self)
+        if self.auction.link then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetHyperlink(self.auction.link)
+            GameTooltip:Show()
         end
-        if data.marketPercent then
-            local cr, cg, cb = QF:GetPriceColor(data.marketPercent)
-            GameTooltip:AddDoubleLine("This listing:", data.marketPercent .. "% of market", 1, 1, 1, cr, cg, cb)
-        end
-        
-        local savings = data.marketPrice and (data.marketPrice - data.unitPrice) or 0
-        if savings > 0 then
-            GameTooltip:AddDoubleLine("You save:", QF:FormatGold(savings), 1, 1, 1, 0, 1, 0)
-        end
-        
-        GameTooltip:AddLine(" ")
-        GameTooltip:AddLine("|cff888888Double-click to instant buy deals|r")
-        GameTooltip:AddLine("|cff888888Press 1-5 for quick buy|r")
-        
-        GameTooltip:Show()
     end)
     
-    row:SetScript("OnLeave", function()
+    btn:SetScript("OnLeave", function(self)
         GameTooltip:Hide()
     end)
+    
+    return btn
 end
 
 -------------------------------------------------------------------------------
--- Keyboard Shortcuts
+-- Auction Selection
 -------------------------------------------------------------------------------
 
-function QF:SetupBuyKeyBindings()
-    if not self.buyFrame then return end
+function QF:SelectAuction(auction)
+    self.selectedAuction = auction
     
-    self.buyFrame:EnableKeyboard(true)
-    self.buyFrame:SetPropagateKeyboardInput(true)
-    
-    self.buyFrame:SetScript("OnKeyDown", function(self, key)
-        local num = tonumber(key)
-        if num and num >= 1 and num <= 5 then
-            local result = QF.searchResults[num]
-            if result then
-                QF.buyFrame:SetPropagateKeyboardInput(false)
-                QF:ConfirmBuy(result, 1)
-                C_Timer.After(0.1, function()
-                    QF.buyFrame:SetPropagateKeyboardInput(true)
-                end)
-                return
+    -- Update selection highlight
+    if self.buyButtons then
+        for _, btn in ipairs(self.buyButtons) do
+            if btn.auction == auction then
+                btn.bg:SetColorTexture(0.2, 0.3, 0.5, 0.8)
+            else
+                local percent = self:GetPercentOfMarket(btn.auction.itemId, btn.auction.unitPrice)
+                if percent and percent < 80 then
+                    btn.bg:SetColorTexture(0, 0.2, 0, 0.5)
+                elseif percent and percent > 100 then
+                    btn.bg:SetColorTexture(0.2, 0, 0, 0.3)
+                else
+                    btn.bg:SetColorTexture(0.1, 0.1, 0.1, 0.8)
+                end
             end
         end
-        self:SetPropagateKeyboardInput(true)
+    end
+    
+    -- Update buy button
+    self:UpdateBuyButton()
+end
+
+function QF:UpdateBuyButton()
+    if not self.buyFrame or not self.buyFrame.buyButton then return end
+    
+    local btn = self.buyFrame.buyButton
+    
+    if self.selectedAuction then
+        local price = self.selectedAuction.buyoutPrice
+        btn:SetText("Buy: " .. self:FormatGoldShort(price))
+        btn:Enable()
+    else
+        btn:SetText("Select an auction")
+        btn:Disable()
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Purchase Execution
+-------------------------------------------------------------------------------
+
+function QF:BuySelectedAuction()
+    if not self.selectedAuction then
+        self:Print("No auction selected!")
+        return
+    end
+    
+    local auction = self.selectedAuction
+    
+    -- Verify auction still exists at the expected index
+    local name = GetAuctionItemInfo("list", auction.index)
+    if not name or name ~= auction.name then
+        self:Print("Auction no longer available!")
+        self:DoSearch(self.buyFrame.searchBox:GetText())
+        return
+    end
+    
+    -- Check if we have enough gold
+    local playerGold = GetMoney()
+    if playerGold < auction.buyoutPrice then
+        self:Print("Not enough gold!")
+        return
+    end
+    
+    -- Execute purchase (buyout)
+    PlaceAuctionBid("list", auction.index, auction.buyoutPrice)
+    
+    -- Record the purchase
+    self:RecordPurchase(auction.itemId, auction.buyoutPrice, auction.count)
+    
+    self:Print("Bought " .. auction.name .. " x" .. auction.count .. " for " .. self:FormatGold(auction.buyoutPrice))
+    
+    -- Clear selection and refresh
+    self.selectedAuction = nil
+    
+    -- Delay refresh to let AH update
+    local delay = CreateFrame("Frame")
+    delay.elapsed = 0
+    delay:SetScript("OnUpdate", function(self, elapsed)
+        self.elapsed = self.elapsed + elapsed
+        if self.elapsed >= 0.5 then
+            self:SetScript("OnUpdate", nil)
+            if QF.buyFrame and QF.buyFrame.searchBox then
+                QF:DoSearch(QF.buyFrame.searchBox:GetText())
+            end
+        end
     end)
 end
 
 -------------------------------------------------------------------------------
+-- Quick Buy (for deals)
+-------------------------------------------------------------------------------
+
+function QF:QuickBuyDeal(index)
+    local name, texture, count, quality, canUse, level, levelColHeader,
+          minBid, minIncrement, buyoutPrice, bidAmount, highBidder,
+          bidderFullName, owner, ownerFullName, saleStatus, itemId, 
+          hasAllInfo = GetAuctionItemInfo("list", index)
+    
+    if not name or not buyoutPrice or buyoutPrice == 0 then
+        return false
+    end
+    
+    local playerGold = GetMoney()
+    if playerGold < buyoutPrice then
+        return false
+    end
+    
+    PlaceAuctionBid("list", index, buyoutPrice)
+    self:RecordPurchase(itemId, buyoutPrice, count)
+    self:Print("Quick bought " .. name .. " for " .. self:FormatGold(buyoutPrice))
+    
+    return true
+end
 
 QF:Debug("Buying.lua loaded")

@@ -1,654 +1,418 @@
 --[[
     QuickFlip - Selling.lua
-    Smart posting with competition analysis and optimal pricing
+    Bag scanning, auction posting
+    Classic Era (Interface 11503)
 ]]
 
 local addonName, QF = ...
-
--- Bag items cache
-QF.bagItems = {}
-QF.pendingPosts = {}
-
--- Durations
-local DURATIONS = {
-    {hours = 12, text = "12h", enum = 1},
-    {hours = 24, text = "24h", enum = 2},
-    {hours = 48, text = "48h", enum = 3},
-}
-
--------------------------------------------------------------------------------
--- Event Registration
--------------------------------------------------------------------------------
-
-local sellFrame = CreateFrame("Frame")
-sellFrame:RegisterEvent("BAG_UPDATE")
-sellFrame:RegisterEvent("AUCTION_HOUSE_SHOW")
--- sellFrame:RegisterEvent("ITEM_SEARCH_RESULTS_UPDATED")
--- sellFrame:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
--- sellFrame:RegisterEvent("AUCTION_HOUSE_AUCTION_CREATED")
--- sellFrame:RegisterEvent("AUCTION_HOUSE_POST_ERROR")
-
-sellFrame:SetScript("OnEvent", function(self, event, ...)
-    if event == "BAG_UPDATE" and QF.isAHOpen then
-        QF:ScanBags()
-    elseif event == "AUCTION_HOUSE_SHOW" then
-        QF:ScanBags()
-    elseif event == "ITEM_SEARCH_RESULTS_UPDATED" or event == "COMMODITY_SEARCH_RESULTS_UPDATED" then
-        QF:OnSellPriceUpdate(...)
-    elseif event == "AUCTION_HOUSE_AUCTION_CREATED" then
-        QF:OnAuctionPosted(...)
-    elseif event == "AUCTION_HOUSE_POST_ERROR" then
-        QF:OnPostError(...)
-    end
-end)
 
 -------------------------------------------------------------------------------
 -- Bag Scanning
 -------------------------------------------------------------------------------
 
+QF.bagItems = {}
+QF.selectedBagItem = nil
+
+-- Duration options (Classic: 1=12h, 2=24h, 3=48h)
+QF.durations = {
+    { value = 1, text = "12 hours" },
+    { value = 2, text = "24 hours" },
+    { value = 3, text = "48 hours" }
+}
+QF.selectedDuration = 2  -- Default to 24h
+
 function QF:ScanBags()
     self.bagItems = {}
     
+    -- Scan bags 0-4
     for bag = 0, 4 do
-        local numSlots = C_Container.GetContainerNumSlots(bag)
+        local numSlots = GetContainerNumSlots(bag)
         for slot = 1, numSlots do
-            local itemInfo = C_Container.GetContainerItemInfo(bag, slot)
+            local texture, count, locked, quality, readable, lootable, link, isFiltered, noValue, itemID = GetContainerItemInfo(bag, slot)
             
-            if itemInfo and itemInfo.itemID then
-                local itemID = itemInfo.itemID
-                local stackCount = itemInfo.stackCount or 1
+            if itemID and count and count > 0 then
+                -- Check if item is tradeable (has sell price and not soulbound)
+                local itemName, itemLink, itemQuality, itemLevel, reqLevel, class, subclass, 
+                      maxStack, equipSlot, itemTexture, sellPrice = GetItemInfo(link or itemID)
                 
-                if self:IsAuctionable(itemID, bag, slot) then
-                    if self.bagItems[itemID] then
-                        self.bagItems[itemID].count = self.bagItems[itemID].count + stackCount
-                        table.insert(self.bagItems[itemID].locations, {
-                            bag = bag, slot = slot, count = stackCount
-                        })
-                    else
-                        local itemName, itemLink, quality, _, _, itemType, _, _, _, itemIcon = C_Item.GetItemInfo(itemID)
-                        local priceData = self:GetPriceData(itemID)
-                        local costBasis = self:GetCostBasis(itemID)
-                        
-                        self.bagItems[itemID] = {
+                -- Get tooltip to check soulbound status
+                local isSoulbound = false
+                local tooltipFrame = CreateFrame("GameTooltip", "QFScanTooltip", nil, "GameTooltipTemplate")
+                tooltipFrame:SetOwner(WorldFrame, "ANCHOR_NONE")
+                tooltipFrame:SetBagItem(bag, slot)
+                
+                for i = 1, tooltipFrame:NumLines() do
+                    local text = _G["QFScanTooltipTextLeft" .. i]
+                    if text then
+                        local lineText = text:GetText()
+                        if lineText and (lineText == ITEM_SOULBOUND or lineText == ITEM_BIND_ON_PICKUP) then
+                            isSoulbound = true
+                            break
+                        end
+                    end
+                end
+                tooltipFrame:Hide()
+                
+                if not isSoulbound and itemName then
+                    -- Check if we already have this item in our list
+                    local found = false
+                    for _, item in ipairs(self.bagItems) do
+                        if item.itemID == itemID then
+                            item.count = item.count + count
+                            item.stacks = item.stacks + 1
+                            found = true
+                            break
+                        end
+                    end
+                    
+                    if not found then
+                        table.insert(self.bagItems, {
+                            bag = bag,
+                            slot = slot,
                             itemID = itemID,
-                            itemName = itemName,
-                            itemLink = itemLink,
-                            itemIcon = itemIcon,
-                            quality = quality or 1,
-                            itemType = itemType,
-                            count = stackCount,
-                            marketPrice = priceData and priceData.marketPrice,
-                            velocity = priceData and priceData.velocity or 0,
-                            competitorCount = priceData and priceData.competitorCount or 0,
-                            costBasis = costBasis,
-                            locations = {{bag = bag, slot = slot, count = stackCount}},
-                        }
+                            name = itemName,
+                            link = link or itemLink,
+                            texture = texture or itemTexture,
+                            count = count,
+                            stacks = 1,
+                            quality = quality or itemQuality,
+                            maxStack = maxStack or 1
+                        })
                     end
                 end
             end
         end
     end
     
-    -- Update sell UI
-    if self.sellFrame and self.sellFrame:IsVisible() then
-        self:UpdateSellDisplay()
-    end
-end
-
-function QF:IsAuctionable(itemID, bag, slot)
-    local itemInfo = C_Container.GetContainerItemInfo(bag, slot)
-    if not itemInfo then return false end
-    
-    -- Skip bound items
-    if itemInfo.isBound then return false end
-    
-    -- Skip quest items
-    local _, _, _, _, _, itemType = C_Item.GetItemInfo(itemID)
-    if itemType == "Quest" then return false end
-    
-    return true
-end
-
--------------------------------------------------------------------------------
--- Smart Pricing (Better than Auctionator!)
--------------------------------------------------------------------------------
-
-function QF:CalculateSmartPrice(itemID)
-    local priceData = self:GetPriceData(itemID)
-    if not priceData or not priceData.marketPrice then
-        return nil, nil, "No market data"
-    end
-    
-    local marketPrice = priceData.marketPrice
-    local competitors = priceData.competitorCount or 0
-    local velocity = priceData.velocity or 0
-    
-    local undercut = self.config and self.config.undercutPercent or 5
-    local basePrice = marketPrice
-    local strategy = "standard"
-    
-    -- Smart undercut based on competition
-    if competitors == 0 then
-        -- We're the only seller - price higher!
-        basePrice = floor(marketPrice * 1.10)  -- 10% above market
-        undercut = 0
-        strategy = "monopoly"
-    elseif competitors <= 3 then
-        -- Low competition - small undercut
-        undercut = 1
-        strategy = "light"
-    elseif competitors <= 10 then
-        -- Moderate competition - standard undercut
-        undercut = self.config and self.config.undercutPercent or 5
-        strategy = "standard"
-    else
-        -- High competition - aggressive undercut
-        undercut = min((self.config and self.config.undercutPercent or 5) + 5, 15)
-        strategy = "aggressive"
-    end
-    
-    -- Adjust for velocity
-    if velocity < 5 then
-        -- Slow seller - be more aggressive
-        undercut = undercut + 3
-        strategy = strategy .. "+slow"
-    elseif velocity > 50 then
-        -- Fast seller - can afford less undercut
-        undercut = max(undercut - 2, 1)
-        strategy = strategy .. "+fast"
-    end
-    
-    local postPrice = floor(basePrice * (1 - undercut / 100))
-    postPrice = max(postPrice, 1)  -- Minimum 1 copper
-    
-    return postPrice, undercut, strategy
-end
-
-function QF:GetPostPrice(itemID)
-    local price, _, _ = self:CalculateSmartPrice(itemID)
-    return price
-end
-
-function QF:GetPotentialProfit(itemID, quantity)
-    local postPrice = self:GetPostPrice(itemID)
-    if not postPrice then return nil end
-    
-    quantity = quantity or 1
-    
-    -- After 5% AH cut
-    local revenue = postPrice * 0.95 * quantity
-    
-    -- Subtract cost basis if we have it
-    local costBasis = self:GetCostBasis(itemID)
-    if costBasis then
-        return floor(revenue - (costBasis * quantity))
-    end
-    
-    return floor(revenue)
-end
-
--------------------------------------------------------------------------------
--- Posting Functions
--------------------------------------------------------------------------------
-
-function QF:PostItem(itemData, quantity, duration, priceOverride)
-    if not self.isAHOpen then
-        self:Print("Auction House must be open!")
-        return false
-    end
-    
-    if not itemData then return false end
-    
-    quantity = quantity or 1
-    duration = duration or 2
-    
-    local postPrice = priceOverride or self:GetPostPrice(itemData.itemID)
-    if not postPrice then
-        self:Print("No price for", itemData.itemLink or itemData.itemName)
-        return false
-    end
-    
-    -- Find item location
-    local location = itemData.locations and itemData.locations[1]
-    if not location then
-        self:Print("Cannot find item in bags!")
-        return false
-    end
-    
-    local itemLocation = ItemLocation:CreateFromBagAndSlot(location.bag, location.slot)
-    if not itemLocation:IsValid() then
-        self:Print("Invalid item location!")
-        return false
-    end
-    
-    -- Check if commodity
-    local isCommodity = C_AuctionHouse.GetItemCommodityStatus(itemLocation) == Enum.ItemCommodityStatus.Commodity
-    
-    -- Track pending post
-    self.pendingPosts[itemData.itemID] = {
-        itemData = itemData,
-        price = postPrice,
-        quantity = quantity,
-        timestamp = time(),
-    }
-    
-    if isCommodity then
-        C_AuctionHouse.PostCommodity(itemLocation, duration, quantity, postPrice)
-    else
-        C_AuctionHouse.PostItem(itemLocation, duration, quantity, nil, postPrice)
-    end
-    
-    self:Debug("Posting:", itemData.itemName, "x", quantity, "@", self:FormatGoldShort(postPrice))
-    return true
-end
-
--- Post all profitable items
-function QF:BulkPost(minProfitPercent)
-    if not self.isAHOpen then
-        self:Print("Auction House must be open!")
-        return
-    end
-    
-    minProfitPercent = minProfitPercent or 10
-    
-    local toPost = {}
-    local totalValue = 0
-    
-    for itemID, data in pairs(self.bagItems) do
-        if data.marketPrice and data.marketPrice > 0 then
-            local postPrice = self:GetPostPrice(itemID)
-            if postPrice then
-                -- Check profitability if we have cost basis
-                local shouldPost = true
-                if data.costBasis then
-                    local profitPercent = ((postPrice * 0.95) - data.costBasis) / data.costBasis * 100
-                    if profitPercent < minProfitPercent then
-                        shouldPost = false
-                    end
-                end
-                
-                if shouldPost then
-                    table.insert(toPost, data)
-                    totalValue = totalValue + (postPrice * data.count)
-                end
-            end
-        end
-    end
-    
-    if #toPost == 0 then
-        self:Print("No profitable items to post!")
-        return
-    end
-    
-    -- Sort by value (highest first)
-    table.sort(toPost, function(a, b)
-        return (a.marketPrice or 0) * a.count > (b.marketPrice or 0) * b.count
+    -- Sort by name
+    table.sort(self.bagItems, function(a, b)
+        return a.name < b.name
     end)
     
-    self:Print("Posting", #toPost, "items worth ~", self:FormatGoldShort(totalValue))
-    
-    -- Post with throttling
-    local postIndex = 1
-    local function PostNext()
-        if postIndex > #toPost then
-            self:Print("|cff00ff00Bulk post complete!|r")
-            self:ScanBags()
-            return
-        end
-        
-        local data = toPost[postIndex]
-        self:PostItem(data, data.count, 2)
-        postIndex = postIndex + 1
-        
-        C_Timer.After(0.4, PostNext)
-    end
-    
-    PostNext()
-end
-
--- Post selected items
-function QF:PostSelected(selectedItems)
-    if not selectedItems or #selectedItems == 0 then
-        self:Print("No items selected!")
-        return
-    end
-    
-    for _, itemID in ipairs(selectedItems) do
-        local data = self.bagItems[itemID]
-        if data then
-            self:PostItem(data, data.count, 2)
-        end
-    end
+    self:Debug("Scanned bags:", #self.bagItems, "unique items")
+    self:UpdateSellList()
 end
 
 -------------------------------------------------------------------------------
--- Post Event Handlers
+-- Sell List UI
 -------------------------------------------------------------------------------
 
-function QF:OnAuctionPosted(auctionID)
-    -- Find pending post
-    for itemID, pending in pairs(self.pendingPosts) do
-        if time() - pending.timestamp < 10 then
-            self:Print("|cff00ff00Posted:|r", pending.itemData.itemLink or pending.itemData.itemName,
-                "x", pending.quantity, "for", self:FormatGoldShort(pending.price * pending.quantity))
-            
-            -- Record sale
-            self:RecordSale(itemID, pending.price * pending.quantity, pending.quantity, pending.itemData.itemName)
-            
-            self.pendingPosts[itemID] = nil
-            break
+function QF:UpdateSellList()
+    if not self.sellFrame or not self.sellFrame.scrollContent then return end
+    
+    local scrollContent = self.sellFrame.scrollContent
+    
+    -- Clear existing buttons
+    if self.sellButtons then
+        for _, btn in ipairs(self.sellButtons) do
+            btn:Hide()
         end
     end
+    self.sellButtons = {}
     
-    -- Refresh bags
-    C_Timer.After(0.5, function()
-        self:ScanBags()
-    end)
-end
-
-function QF:OnPostError(auctionID)
-    self:Print("|cffff0000Post failed!|r Check the item and try again.")
-    self.pendingPosts = {}
-end
-
-function QF:OnSellPriceUpdate(itemID)
-    -- Update item price when we get new data
-    if self.bagItems[itemID] then
-        local priceData = self:GetPriceData(itemID)
-        if priceData then
-            self.bagItems[itemID].marketPrice = priceData.marketPrice
-            self.bagItems[itemID].velocity = priceData.velocity
-            self.bagItems[itemID].competitorCount = priceData.competitorCount
-        end
-        
-        if self.sellFrame and self.sellFrame:IsVisible() then
-            self:UpdateSellDisplay()
-        end
+    local yOffset = 0
+    
+    for i, item in ipairs(self.bagItems) do
+        local btn = self:CreateSellItemButton(scrollContent, item, i)
+        btn:SetPoint("TOPLEFT", 0, -yOffset)
+        btn:Show()
+        table.insert(self.sellButtons, btn)
+        yOffset = yOffset + 32
+    end
+    
+    -- Update scroll content height
+    scrollContent:SetHeight(math.max(1, yOffset))
+    
+    -- Update item count
+    if self.sellFrame.itemCount then
+        self.sellFrame.itemCount:SetText(#self.bagItems .. " items")
     end
 end
 
--------------------------------------------------------------------------------
--- Refresh Sell Prices (Scan all bag items)
--------------------------------------------------------------------------------
-
-function QF:RefreshSellPrices()
-    if not self.isAHOpen then return end
+function QF:CreateSellItemButton(parent, item, index)
+    local btn = CreateFrame("Button", nil, parent)
+    btn:SetSize(parent:GetWidth() - 20, 30)
     
-    local toScan = {}
-    for itemID, data in pairs(self.bagItems) do
-        if not data.marketPrice then
-            table.insert(toScan, itemID)
-        end
-    end
+    -- Background
+    local bg = btn:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetColorTexture(0.1, 0.1, 0.1, 0.8)
+    btn.bg = bg
     
-    if #toScan == 0 then
-        self:Print("All items have prices")
-        return
-    end
-    
-    self:Print("Scanning", #toScan, "items...")
-    
-    local scanIndex = 1
-    local function ScanNext()
-        if scanIndex > #toScan then
-            self:Print("Price refresh complete")
-            return
-        end
-        
-        self:ScanItem(toScan[scanIndex])
-        scanIndex = scanIndex + 1
-        
-        C_Timer.After(0.2, ScanNext)
-    end
-    
-    ScanNext()
-end
-
--------------------------------------------------------------------------------
--- UI Update
--------------------------------------------------------------------------------
-
-function QF:UpdateSellDisplay()
-    if not self.sellFrame then return end
-    
-    -- Clear rows
-    for _, row in ipairs(self.sellFrame.rows or {}) do
-        row:Hide()
-    end
-    
-    self.sellFrame.rows = self.sellFrame.rows or {}
-    
-    -- Sort items by potential profit
-    local sortedItems = {}
-    for _, data in pairs(self.bagItems) do
-        local profit = self:GetPotentialProfit(data.itemID, data.count)
-        data.potentialProfit = profit
-        table.insert(sortedItems, data)
-    end
-    
-    table.sort(sortedItems, function(a, b)
-        return (a.potentialProfit or 0) > (b.potentialProfit or 0)
-    end)
-    
-    -- Calculate totals
-    local totalValue = 0
-    local totalProfit = 0
-    local itemsWithPrice = 0
-    
-    -- Build rows
-    local yOffset = -5
-    for i, data in ipairs(sortedItems) do
-        if i > 40 then break end
-        
-        local row = self.sellFrame.rows[i]
-        if not row then
-            row = self:CreateSellRow(self.sellFrame.scrollChild, i)
-            self.sellFrame.rows[i] = row
-        end
-        
-        self:UpdateSellRow(row, data)
-        row:SetPoint("TOPLEFT", self.sellFrame.scrollChild, "TOPLEFT", 0, yOffset)
-        row:Show()
-        
-        yOffset = yOffset - 32
-        
-        if data.marketPrice then
-            totalValue = totalValue + (data.marketPrice * data.count)
-            itemsWithPrice = itemsWithPrice + 1
-            if data.potentialProfit then
-                totalProfit = totalProfit + data.potentialProfit
-            end
-        end
-    end
-    
-    self.sellFrame.scrollChild:SetHeight(math.abs(yOffset) + 20)
-    
-    -- Update totals
-    if self.sellFrame.totalText then
-        self.sellFrame.totalText:SetText("Bag Value: " .. self:FormatGold(totalValue))
-    end
-    if self.sellFrame.profitText then
-        local profitColor = totalProfit >= 0 and "|cff00ff00" or "|cffff0000"
-        self.sellFrame.profitText:SetText("Est. Profit: " .. profitColor .. self:FormatGold(totalProfit) .. "|r")
-    end
-    if self.sellFrame.countText then
-        self.sellFrame.countText:SetText(itemsWithPrice .. "/" .. #sortedItems .. " priced")
-    end
-end
-
-function QF:CreateSellRow(parent, index)
-    local row = CreateFrame("Button", nil, parent, "BackdropTemplate")
-    row:SetSize(385, 30)
-    row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
-    
-    -- Profit indicator bar
-    row.profitBar = row:CreateTexture(nil, "BACKGROUND")
-    row.profitBar:SetSize(4, 28)
-    row.profitBar:SetPoint("LEFT", 0, 0)
+    -- Highlight
+    local highlight = btn:CreateTexture(nil, "HIGHLIGHT")
+    highlight:SetAllPoints()
+    highlight:SetColorTexture(0.3, 0.3, 0.3, 0.5)
     
     -- Icon
-    row.icon = row:CreateTexture(nil, "ARTWORK")
-    row.icon:SetSize(26, 26)
-    row.icon:SetPoint("LEFT", 8, 0)
+    local icon = btn:CreateTexture(nil, "ARTWORK")
+    icon:SetSize(24, 24)
+    icon:SetPoint("LEFT", 4, 0)
+    icon:SetTexture(item.texture)
     
-    -- Name
-    row.name = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    row.name:SetPoint("LEFT", row.icon, "RIGHT", 5, 0)
-    row.name:SetWidth(100)
-    row.name:SetJustifyH("LEFT")
+    -- Item name
+    local nameText = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    nameText:SetPoint("LEFT", icon, "RIGHT", 4, 0)
+    nameText:SetWidth(120)
+    nameText:SetJustifyH("LEFT")
     
-    -- Quantity
-    row.qty = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row.qty:SetPoint("LEFT", row.name, "RIGHT", 3, 0)
-    row.qty:SetWidth(35)
+    local qualityColor = ITEM_QUALITY_COLORS[item.quality or 1]
+    if qualityColor then
+        nameText:SetTextColor(qualityColor.r, qualityColor.g, qualityColor.b)
+    end
+    nameText:SetText(item.name)
     
-    -- Post Price
-    row.price = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    row.price:SetPoint("LEFT", row.qty, "RIGHT", 3, 0)
-    row.price:SetWidth(65)
+    -- Count
+    local countText = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    countText:SetPoint("LEFT", nameText, "RIGHT", 5, 0)
+    countText:SetWidth(40)
+    countText:SetJustifyH("RIGHT")
+    countText:SetText("x" .. item.count)
+    countText:SetTextColor(0.7, 0.7, 0.7)
     
-    -- Profit
-    row.profit = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    row.profit:SetPoint("LEFT", row.price, "RIGHT", 3, 0)
-    row.profit:SetWidth(55)
+    -- Market price
+    local priceText = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    priceText:SetPoint("LEFT", countText, "RIGHT", 10, 0)
+    priceText:SetWidth(80)
+    priceText:SetJustifyH("RIGHT")
     
-    -- Velocity indicator
-    row.velocity = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    row.velocity:SetPoint("LEFT", row.profit, "RIGHT", 3, 0)
-    row.velocity:SetWidth(30)
-    
-    -- Sell button
-    row.sellBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-    row.sellBtn:SetSize(45, 24)
-    row.sellBtn:SetPoint("RIGHT", -5, 0)
-    row.sellBtn:SetText("Sell")
-    
-    -- Checkbox for bulk select
-    row.check = CreateFrame("CheckButton", nil, row, "UICheckButtonTemplate")
-    row.check:SetSize(20, 20)
-    row.check:SetPoint("RIGHT", row.sellBtn, "LEFT", -2, 0)
-    
-    return row
-end
-
-function QF:UpdateSellRow(row, data)
-    row.icon:SetTexture(data.itemIcon or "Interface\\Icons\\INV_Misc_QuestionMark")
-    
-    -- Name colored by quality
-    local color = ITEM_QUALITY_COLORS[data.quality or 1] or ITEM_QUALITY_COLORS[1]
-    row.name:SetText(data.itemName or "Loading...")
-    row.name:SetTextColor(color.r, color.g, color.b)
-    
-    row.qty:SetText("x" .. data.count)
-    
-    -- Post price with strategy hint
-    local postPrice, undercut, strategy = self:CalculateSmartPrice(data.itemID)
-    if postPrice then
-        row.price:SetText(self:FormatGoldShort(postPrice))
-        
-        -- Profit bar color
-        local profit = self:GetPotentialProfit(data.itemID, data.count)
-        if profit then
-            if profit > 0 then
-                row.profitBar:SetColorTexture(0, 1, 0, 0.8)
-                row.profit:SetText("|cff00ff00+" .. self:FormatGoldShort(profit) .. "|r")
-            else
-                row.profitBar:SetColorTexture(1, 0, 0, 0.8)
-                row.profit:SetText("|cffff0000" .. self:FormatGoldShort(profit) .. "|r")
-            end
-        else
-            row.profitBar:SetColorTexture(0.5, 0.5, 0.5, 0.8)
-            row.profit:SetText(self:FormatGoldShort(postPrice * data.count * 0.95))
-        end
+    local marketPrice = self:GetMarketPrice(item.itemID)
+    if marketPrice then
+        priceText:SetText(self:FormatGoldShort(marketPrice))
+        priceText:SetTextColor(1, 0.82, 0)
     else
-        row.price:SetText("|cff888888Scan|r")
-        row.profit:SetText("--")
-        row.profitBar:SetColorTexture(0.3, 0.3, 0.3, 0.5)
+        priceText:SetText("No data")
+        priceText:SetTextColor(0.5, 0.5, 0.5)
     end
     
-    -- Velocity indicator
-    if data.velocity and data.velocity > 0 then
-        if data.velocity >= 50 then
-            row.velocity:SetText("|cff00ff00⚡|r")  -- Fast
-        elseif data.velocity >= 10 then
-            row.velocity:SetText("|cffffff00●|r")  -- Medium
-        else
-            row.velocity:SetText("|cffff0000○|r")  -- Slow
-        end
-    else
-        row.velocity:SetText("")
-    end
+    -- Store item data
+    btn.item = item
     
-    row.data = data
-    
-    -- Sell button
-    row.sellBtn:SetScript("OnClick", function()
-        if postPrice then
-            QF:PostItem(data, data.count, 2)
-        else
-            QF:Print("Scan prices first!")
-            QF:ScanItem(data.itemID)
-        end
-    end)
-    
-    -- Right-click to sell 1
-    row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-    row:SetScript("OnClick", function(self, button)
-        if button == "RightButton" and postPrice then
-            QF:PostItem(data, 1, 2)
-        end
+    -- Click handler - put in sell slot
+    btn:SetScript("OnClick", function(self)
+        QF:SelectBagItem(self.item)
     end)
     
     -- Tooltip
-    row:SetScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        if data.itemLink then
-            GameTooltip:SetHyperlink(data.itemLink)
-        else
-            GameTooltip:SetItemByID(data.itemID)
+    btn:SetScript("OnEnter", function(self)
+        if self.item.link then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetHyperlink(self.item.link)
+            GameTooltip:Show()
         end
-        
-        GameTooltip:AddLine(" ")
-        GameTooltip:AddLine("|cffFFD700QuickFlip Pricing|r")
-        
-        if data.marketPrice then
-            GameTooltip:AddDoubleLine("Market:", QF:FormatGold(data.marketPrice), 1, 1, 1, 1, 1, 1)
-        end
-        
-        if postPrice then
-            GameTooltip:AddDoubleLine("Post at:", QF:FormatGold(postPrice), 1, 1, 1, 0.5, 1, 0.5)
-            if strategy then
-                GameTooltip:AddDoubleLine("Strategy:", strategy, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7)
-            end
-            if undercut then
-                GameTooltip:AddDoubleLine("Undercut:", undercut .. "%", 0.7, 0.7, 0.7, 0.7, 0.7, 0.7)
-            end
-        end
-        
-        if data.costBasis then
-            GameTooltip:AddDoubleLine("You paid:", QF:FormatGold(data.costBasis), 1, 1, 1, 1, 0.5, 0.5)
-        end
-        
-        if data.competitorCount and data.competitorCount > 0 then
-            GameTooltip:AddDoubleLine("Competition:", data.competitorCount .. " sellers", 0.7, 0.7, 0.7, 0.7, 0.7, 0.7)
-        end
-        
-        if data.velocity then
-            local velText = data.velocity >= 50 and "Fast" or data.velocity >= 10 and "Medium" or "Slow"
-            GameTooltip:AddDoubleLine("Sells:", velText .. " (" .. floor(data.velocity) .. "/day)", 0.7, 0.7, 0.7, 0.7, 0.7, 0.7)
-        end
-        
-        GameTooltip:AddLine(" ")
-        GameTooltip:AddLine("|cff888888Right-click to sell 1|r")
-        
-        GameTooltip:Show()
     end)
     
-    row:SetScript("OnLeave", function()
+    btn:SetScript("OnLeave", function(self)
         GameTooltip:Hide()
+    end)
+    
+    return btn
+end
+
+-------------------------------------------------------------------------------
+-- Item Selection & Posting
+-------------------------------------------------------------------------------
+
+function QF:SelectBagItem(item)
+    self.selectedBagItem = item
+    
+    -- Find the first stack of this item and put it in the sell slot
+    for bag = 0, 4 do
+        local numSlots = GetContainerNumSlots(bag)
+        for slot = 1, numSlots do
+            local texture, count, locked, quality, readable, lootable, link, isFiltered, noValue, itemID = GetContainerItemInfo(bag, slot)
+            if itemID == item.itemID then
+                -- Clear any existing item
+                ClearCursor()
+                
+                -- Pick up the item
+                PickupContainerItem(bag, slot)
+                
+                -- Put it in the auction sell slot
+                ClickAuctionSellItemButton()
+                
+                -- Update the sell info
+                self:UpdateSellInfo()
+                return
+            end
+        end
+    end
+    
+    self:Print("Could not find item in bags!")
+end
+
+function QF:UpdateSellInfo()
+    if not self.sellFrame then return end
+    
+    -- Get info about item in sell slot
+    local name, texture, count, quality, canUse, price = GetAuctionSellItemInfo()
+    
+    if not name then
+        -- No item in sell slot
+        if self.sellFrame.sellItemName then
+            self.sellFrame.sellItemName:SetText("Drop item here")
+        end
+        if self.sellFrame.postButton then
+            self.sellFrame.postButton:Disable()
+        end
+        return
+    end
+    
+    -- Update display
+    if self.sellFrame.sellItemName then
+        self.sellFrame.sellItemName:SetText(name .. " x" .. (count or 1))
+    end
+    
+    if self.sellFrame.sellItemIcon then
+        self.sellFrame.sellItemIcon:SetTexture(texture)
+    end
+    
+    -- Get suggested price from database
+    local itemID = self.selectedBagItem and self.selectedBagItem.itemID
+    local marketPrice = itemID and self:GetMarketPrice(itemID)
+    
+    if marketPrice then
+        -- Suggest slightly below market
+        local suggestedPrice = math.floor(marketPrice * 0.95)
+        
+        if self.sellFrame.priceBox then
+            -- Set price in the editbox (as copper)
+            local gold = math.floor(suggestedPrice / 10000)
+            local silver = math.floor((suggestedPrice % 10000) / 100)
+            self.sellFrame.priceBox:SetText(gold .. "g " .. silver .. "s")
+        end
+        
+        if self.sellFrame.marketPriceText then
+            self.sellFrame.marketPriceText:SetText("Market: " .. self:FormatGold(marketPrice))
+        end
+    end
+    
+    -- Calculate deposit
+    local deposit = CalculateAuctionDeposit(self.selectedDuration)
+    if self.sellFrame.depositText then
+        self.sellFrame.depositText:SetText("Deposit: " .. self:FormatGold(deposit))
+    end
+    
+    -- Enable post button
+    if self.sellFrame.postButton then
+        self.sellFrame.postButton:Enable()
+    end
+end
+
+function QF:ParsePriceInput(text)
+    if not text or text == "" then return 0 end
+    
+    local copper = 0
+    
+    -- Parse gold
+    local gold = text:match("(%d+)%s*g")
+    if gold then copper = copper + tonumber(gold) * 10000 end
+    
+    -- Parse silver
+    local silver = text:match("(%d+)%s*s")
+    if silver then copper = copper + tonumber(silver) * 100 end
+    
+    -- Parse copper
+    local cop = text:match("(%d+)%s*c")
+    if cop then copper = copper + tonumber(cop) end
+    
+    -- If no units specified, assume it's just a number (gold)
+    if copper == 0 then
+        local num = tonumber(text)
+        if num then copper = num * 10000 end
+    end
+    
+    return copper
+end
+
+function QF:PostAuction()
+    -- Check if item is in sell slot
+    local name, texture, count, quality, canUse, price = GetAuctionSellItemInfo()
+    if not name then
+        self:Print("No item in sell slot!")
+        return
+    end
+    
+    -- Get price from input
+    local priceText = self.sellFrame.priceBox and self.sellFrame.priceBox:GetText() or ""
+    local buyoutPrice = self:ParsePriceInput(priceText)
+    
+    if buyoutPrice <= 0 then
+        self:Print("Invalid price!")
+        return
+    end
+    
+    -- Start price slightly lower than buyout
+    local startPrice = math.floor(buyoutPrice * 0.95)
+    
+    -- Duration
+    local duration = self.selectedDuration
+    
+    -- Post the auction
+    StartAuction(startPrice, buyoutPrice, duration)
+    
+    -- Record the sale attempt
+    local itemID = self.selectedBagItem and self.selectedBagItem.itemID
+    if itemID then
+        self:RecordSale(itemID, buyoutPrice, count)
+    end
+    
+    local durationText = self.durations[duration] and self.durations[duration].text or "?"
+    self:Print("Posted " .. name .. " for " .. self:FormatGold(buyoutPrice) .. " (" .. durationText .. ")")
+    
+    -- Clear selection and refresh
+    self.selectedBagItem = nil
+    
+    -- Delay to let AH update
+    local delay = CreateFrame("Frame")
+    delay.elapsed = 0
+    delay:SetScript("OnUpdate", function(self, elapsed)
+        self.elapsed = self.elapsed + elapsed
+        if self.elapsed >= 0.5 then
+            self:SetScript("OnUpdate", nil)
+            QF:ScanBags()
+            QF:UpdateSellInfo()
+        end
     end)
 end
 
 -------------------------------------------------------------------------------
+-- Your Auctions
+-------------------------------------------------------------------------------
+
+function QF:GetMyAuctions()
+    local auctions = {}
+    local numAuctions = GetNumAuctionItems("owner")
+    
+    for i = 1, numAuctions do
+        local name, texture, count, quality, canUse, level, levelColHeader,
+              minBid, minIncrement, buyoutPrice, bidAmount, highBidder,
+              bidderFullName, owner, ownerFullName, saleStatus, itemId, 
+              hasAllInfo = GetAuctionItemInfo("owner", i)
+        
+        if name then
+            table.insert(auctions, {
+                index = i,
+                name = name,
+                texture = texture,
+                count = count,
+                quality = quality,
+                minBid = minBid,
+                buyoutPrice = buyoutPrice,
+                bidAmount = bidAmount,
+                highBidder = highBidder,
+                saleStatus = saleStatus,
+                itemId = itemId
+            })
+        end
+    end
+    
+    return auctions
+end
+
+function QF:CancelAuction(index)
+    CancelAuction(index)
+    self:Print("Cancelled auction #" .. index)
+end
 
 QF:Debug("Selling.lua loaded")
