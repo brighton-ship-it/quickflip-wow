@@ -456,3 +456,35 @@ StaticPopupDialogs["QUICKFLIP_INSTANT_BUY"] = {
 -------------------------------------------------------------------------------
 
 QF:Debug("Core.lua loaded")
+
+-------------------------------------------------------------------------------
+-- Flip Suggestions (placeholder)
+-------------------------------------------------------------------------------
+function QF:CalculateFlipSuggestions()
+    -- Calculate potential flips based on price data
+    QF.flipSuggestions = QF.flipSuggestions or {}
+    
+    -- Only calculate if we have price data
+    if not QF.db or not QF.db.prices then return end
+    
+    -- Basic flip detection - items selling below average
+    for itemID, data in pairs(QF.db.prices) do
+        if data.marketPrice and data.minPrice then
+            local margin = data.marketPrice - data.minPrice
+            local marginPct = (margin / data.marketPrice) * 100
+            
+            if marginPct > 20 then -- 20%+ margin
+                table.insert(QF.flipSuggestions, {
+                    itemID = itemID,
+                    buyPrice = data.minPrice,
+                    sellPrice = data.marketPrice,
+                    margin = margin,
+                    marginPct = marginPct
+                })
+            end
+        end
+    end
+    
+    -- Sort by margin percentage
+    table.sort(QF.flipSuggestions, function(a, b) return a.marginPct > b.marginPct end)
+end
