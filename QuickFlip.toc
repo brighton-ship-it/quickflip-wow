@@ -1,0 +1,16 @@
+## Interface: 11503
+## Interface-Cata: 40400
+## Title: QuickFlip
+## Notes: Simple auction house buying and selling for WoW Classic
+## Author: SCWS
+## Version: 1.0.0
+## SavedVariables: QuickFlipDB
+
+embeds.xml
+Core.lua
+Database.lua
+Scanner.lua
+Buying.lua
+Selling.lua
+UI.lua
+Config.lua
